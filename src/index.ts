@@ -1,6 +1,27 @@
 import dgram from 'dgram';
 import fs from 'fs';
 
+const defaultImageOptions: Required<ImageOptions> = {
+  width: 32,
+  height: 32,
+  layer: 15,
+  offsetX: 0,
+  offsetY: 0,
+};
+
+/** Merges options, ignoring keys that are explicitly `undefined`. */
+function withDefaults<T extends object>(defaults: Required<T>, options?: T): Required<T> {
+  const merged = {...defaults};
+  for (const [key, value] of Object.entries(options ?? {})) {
+    if (value !== undefined) (merged as Record<string, unknown>)[key] = value;
+  }
+  return merged;
+}
+
+function ftHeader(options: Required<ImageOptions>) {
+  return `P6\n${options.width} ${options.height}\n#FT: ${options.offsetX} ${options.offsetY} ${options.layer}\n255\n`;
+}
+
 /**
  * Class for constructing a binary PPM image file and transmitting it to a remote host via UDP
  * in Flaschen Taschen RGB matrix protocol.
@@ -13,13 +34,7 @@ import fs from 'fs';
  */
 export class FlaschenTaschenClient {
   private port = 1337;
-  private readonly defaultImageOptions: ImageOptions = {
-    width: 32,
-    height: 32,
-    layer: 15,
-    offsetX: 0,
-    offsetY: 0,
-  };
+  private socket?: dgram.Socket;
   // Suppress debug messages
   public silent = true;
 
@@ -33,63 +48,95 @@ export class FlaschenTaschenClient {
    * several helper methods for image manipulation.
    */
   public create(options?: ImageOptions) {
-    const mergedOptions = {...this.defaultImageOptions, ...options};
-    return new FlaschenTaschenImage(mergedOptions);
+    return new FlaschenTaschenImage(options);
   }
 
   /**
-   * Accetps a FlaschenTaschenImage instance, and transmits the
-   * instance buffer to the target host.
+   * Transmits the image buffer to the target host.
+   *
+   * `options` overrides the image's layer and offset for this send only, so one image can be
+   * drawn to several places without rebuilding it.
+   *
+   * Resolves with the number of bytes sent, or rejects if the send fails.
    */
-  public render(ftImage: FlaschenTaschenImage) {
-    const client = dgram.createSocket('udp4');
+  public render(ftImage: FlaschenTaschenImage, options?: RenderOptions): Promise<number> {
+    const socket = this.getSocket();
 
-    client.send(ftImage.buffer, this.port, this.host, (error, bytes) => {
-      if (error) throw error;
+    return new Promise((resolve, reject) => {
+      socket.send(ftImage.packet(options), this.port, this.host, (error, bytes) => {
+        if (error) return reject(error);
 
-      if (!this.silent) {
-        console.log(`UDP message sent to ${this.host}:${this.port} (${bytes} bytes)`);
-      }
-      client.close();
+        if (!this.silent) {
+          console.log(`UDP message sent to ${this.host}:${this.port} (${bytes} bytes)`);
+        }
+        resolve(bytes);
+      });
     });
+  }
+
+  /**
+   * Clears a layer by sending a black image to it. On layers above 0, black is transparent,
+   * so whatever is underneath shows through.
+   */
+  public clearLayer(options?: ImageOptions): Promise<number> {
+    return this.render(this.create(options));
+  }
+
+  /**
+   * Closes the UDP socket. The socket doesn't keep the process alive, so this is only needed
+   * to release it early. A later `render()` opens a new one.
+   */
+  public close(): Promise<void> {
+    const socket = this.socket;
+    this.socket = undefined;
+    if (!socket) return Promise.resolve();
+    return new Promise(resolve => socket.close(() => resolve()));
+  }
+
+  private getSocket() {
+    if (!this.socket) {
+      const socket = dgram.createSocket('udp4');
+      socket.unref();
+      // Drop a broken socket; the next render opens a fresh one.
+      socket.on('error', error => {
+        if (!this.silent) console.error(`UDP socket error: ${error.message}`);
+        if (this.socket === socket) this.socket = undefined;
+        socket.close();
+      });
+      this.socket = socket;
+    }
+    return this.socket;
   }
 }
 
 /**
  * FT Image Class
  * Creates a binary buffer in PPM image format with FT specific headers.
- * Use the `plot()` method to draw pixels to the image, or the write method
+ * Use the `plot()` or `blit()` methods to draw pixels to the image, or the write method
  * to output the buffer to a file in ppm format.
  */
 export class FlaschenTaschenImage {
-  private header: string;
-  private width: number;
-  private height: number;
-  private readonly ppmFileType = 'P6';
+  public readonly width: number;
+  public readonly height: number;
   public buffer: Buffer;
+  private header: string;
+  private options: Required<ImageOptions>;
 
-  constructor(options: ImageOptions) {
-    this.init(options);
+  constructor(options?: ImageOptions) {
+    this.options = withDefaults(defaultImageOptions, options);
+    this.width = this.options.width;
+    this.height = this.options.height;
+    // PPM header packet string
+    this.header = ftHeader(this.options);
+    this.buffer = Buffer.alloc(this.header.length + this.width * this.height * 3);
+    this.buffer.write(this.header);
   }
 
   /**
-   * Initialises the PPM binary buffer.
-   * Use @link plot() to draw pixels.
+   * The RGB pixel data, without the header. A view into `buffer`, so writes to it change the image.
    */
-  private init(options: ImageOptions) {
-    // PPM header packet string
-    this.header = `${this.ppmFileType}\n${options.width} ${options.height}\n#FT: ${options.offsetX} ${options.offsetY} ${options.layer}\n255\n`;
-    // PPM footer packet string
-    const footer = ``;
-
-    this.width = options.width!;
-    this.height = options.height!;
-
-    this.buffer = Buffer.alloc(this.header.length + footer.length + options.height! * options.width! * 3);
-
-    this.buffer.write(this.header);
-    const start = this.buffer.length - footer.length;
-    this.buffer.write(footer, start);
+  public get pixels(): Buffer {
+    return this.buffer.subarray(this.header.length);
   }
 
   /**
@@ -108,6 +155,34 @@ export class FlaschenTaschenImage {
   }
 
   /**
+   * Copies a whole image into this one. `data` holds rows top to bottom, with `channels` bytes
+   * per pixel, and must be exactly `width * height * channels` bytes long.
+   *
+   * With 4 channels (RGBA) the alpha is applied against black, which ft-server treats as
+   * transparent on layers above 0.
+   */
+  public blit(data: Uint8Array, channels: 3 | 4 = 3) {
+    const pixelCount = this.width * this.height;
+    if (data.length !== pixelCount * channels) {
+      throw new RangeError(
+        `Expected ${pixelCount * channels} bytes for a ${this.width}x${this.height} image with ${channels} channels, got ${data.length}`,
+      );
+    }
+
+    const pixels = this.pixels;
+    if (channels === 3) {
+      pixels.set(data);
+      return;
+    }
+    for (let i = 0, j = 0; i < pixelCount; i++, j += 4) {
+      const alpha = data[j + 3];
+      pixels[i * 3] = Math.round((data[j] * alpha) / 255);
+      pixels[i * 3 + 1] = Math.round((data[j + 1] * alpha) / 255);
+      pixels[i * 3 + 2] = Math.round((data[j + 2] * alpha) / 255);
+    }
+  }
+
+  /**
    * Write the PPM buffer to file
    * @param path Output Path/filename. Example `./image.ppm`
    */
@@ -123,22 +198,35 @@ export class FlaschenTaschenImage {
    * Wipes the current image by setting every pixel to black.
    */
   public clear() {
-    for (let x = 0; x < this.width; x++) {
-      for (let y = 0; y < this.height; y++) {
-        this.plot(x, y, {r: 0, g: 0, b: 0});
-      }
-    }
+    this.pixels.fill(0);
+  }
+
+  /**
+   * The bytes to send. With overrides, a new header is paired with the existing pixel data,
+   * so the image itself isn't changed.
+   */
+  public packet(options?: RenderOptions): Buffer | Buffer[] {
+    if (!options) return this.buffer;
+    const {layer, offsetX, offsetY} = options;
+    const header = ftHeader(withDefaults(this.options, {layer, offsetX, offsetY}));
+    return header === this.header ? this.buffer : [Buffer.from(header), this.pixels];
   }
 }
 
 /**
  * PPM Image options
  */
-export interface ImageOptions {
+export interface ImageOptions extends RenderOptions {
   // Canvas height
   height?: number;
   // Canvas width
   width?: number;
+}
+
+/**
+ * Where an image is drawn. Can be overridden per send with `render()`.
+ */
+export interface RenderOptions {
   // Z-offset
   layer?: number;
   // X-offset
